@@ -394,6 +394,10 @@ extension Ghostty {
                         }
                         return .ignored
                     }
+                    .backport.onKeyPress(.init("v")) { modifiers in
+                        guard modifiers.contains(.command) else { return .ignored }
+                        return searchState.pasteNeedle() ? .handled : .ignored
+                    }
 
                     Button(action: {
                         _ = surfaceView.navigateSearchToNext()

@@ -107,4 +107,48 @@ import Testing
         let expected = "pb".startIndex..<"pb".endIndex
         #expect(sut.needle.selection == expected)
     }
+
+    @Test func insertNeedleText_appendsWhenSelectionIsNil() {
+        let sut = SearchState(
+            from: StartSearch(c: .init(needle: nil)),
+            pasteboard: pasteboard
+        )
+        sut.setNeedle("ab")
+
+        sut.insertNeedleText("cd")
+
+        #expect(sut.needle.text == "abcd")
+        #expect(sut.needle.selection == sut.needle.text.endIndex..<sut.needle.text.endIndex)
+    }
+
+    @Test func insertNeedleText_replacesSelection() {
+        let sut = SearchState(
+            from: StartSearch(c: .init(needle: nil)),
+            pasteboard: pasteboard
+        )
+        sut.setNeedle("abcd")
+        let selectionStart = sut.needle.text.index(after: sut.needle.text.startIndex)
+        let selectionEnd = sut.needle.text.index(before: sut.needle.text.endIndex)
+        sut.needle.selection = selectionStart..<selectionEnd
+
+        sut.insertNeedleText("X")
+
+        let caret = sut.needle.text.index(sut.needle.text.startIndex, offsetBy: 2)
+        #expect(sut.needle.text == "aXd")
+        #expect(sut.needle.selection == caret..<caret)
+    }
+
+    @Test func pasteNeedle_readsPasteboard() {
+        let sut = SearchState(
+            from: StartSearch(c: .init(needle: nil)),
+            pasteboard: pasteboard
+        )
+        let sourcePasteboard = NSPasteboard.withUniqueName()
+        sourcePasteboard.setString("cd", forType: .string)
+        sut.setNeedle("ab")
+
+        sut.pasteNeedle(from: sourcePasteboard)
+
+        #expect(sut.needle.text == "abcd")
+    }
 }

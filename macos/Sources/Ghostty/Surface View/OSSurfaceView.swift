@@ -167,6 +167,30 @@ extension Ghostty.OSSurfaceView {
         func writePasteboardNeedle() {
             pasteboard.string = needle.text
         }
+
+        func insertNeedleText(_ text: String) {
+            guard !text.isEmpty else { return }
+
+            var needleText = needle.text
+            let range = needle.selection ?? needleText.endIndex..<needleText.endIndex
+            let lowerBoundOffset = needleText.distance(from: needleText.startIndex, to: range.lowerBound)
+
+            needleText.replaceSubrange(range, with: text)
+
+            let caretOffset = lowerBoundOffset + text.count
+            let caret = needleText.index(needleText.startIndex, offsetBy: caretOffset)
+            needle = .init(text: needleText, selection: caret..<caret)
+        }
+
+        @discardableResult
+        func pasteNeedle(from pasteboard: NSPasteboard = .general) -> Bool {
+            guard let text = pasteboard.string(forType: .string), !text.isEmpty else {
+                return false
+            }
+
+            insertNeedleText(text)
+            return true
+        }
     }
 
     func navigateSearchToNext() -> Bool {

@@ -1326,6 +1326,12 @@ extension Ghostty {
             // to receive any other event type here.
             guard event.type == .keyDown else { return false }
 
+            // If an AppKit field editor is focused, standard edit shortcuts
+            // such as Cmd+V should stay with the text field.
+            if window?.firstResponder is NSTextView {
+                return false
+            }
+
             // Only process events if we're focused. Some key events like C-/ macOS
             // appears to send to the first view in the hierarchy rather than the
             // the first responder (I don't know why). This prevents us from handling it.

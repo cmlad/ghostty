@@ -68,6 +68,12 @@ final class GhosttyMouseStateTests: GhosttyCustomConfigCase {
 
         XCTAssertTrue(textfield.stringValue == "ab", "Search text should be `ab`")
 
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("paste", forType: .string)
+        app.typeKey("v", modifierFlags: .command)
+
+        XCTAssertTrue(textfield.stringValue == "abpaste", "Search text should include pasted contents")
+
         // resign
         app.typeKey(.escape, modifierFlags: [])
 
