@@ -51,9 +51,19 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// re-showing a tab/window that was already closed.
     private var pendingInitialPresentation: DispatchWorkItem?
 
+    /// Short-lived diagnostics for AppKit moving a native tab group while a new
+    /// tab is being created.
+    private var newTabPositionTraceID: String?
+    private weak var newTabPositionParent: NSWindow?
+    private var newTabPositionOriginalFrame: NSRect?
+    private var newTabPositionOriginalDisplayID: UInt32?
+
     /// This is set to false by init if the window managed by this controller should not be restorable.
     /// For example, terminals executing custom scripts are not restorable.
     private var restorable: Bool = true
+
+    /// True while presenting a window that AppKit has already attached as a native tab.
+    private var isShowingWindowAsTab: Bool = false
 
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private(set) var derivedConfig: DerivedConfig
@@ -166,6 +176,54 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         DispatchQueue.main.async(execute: workItem)
     }
 
+    private func beginNewTabPositionTrace(
+        traceID: String,
+        parent: NSWindow,
+        originalFrame: NSRect,
+        originalDisplayID: UInt32?
+    ) {
+        newTabPositionTraceID = traceID
+        newTabPositionParent = parent
+        newTabPositionOriginalFrame = originalFrame
+        newTabPositionOriginalDisplayID = originalDisplayID
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, self.newTabPositionTraceID == traceID else { return }
+            let child = self.window === parent ? nil : self.window
+            Self.logNewTabPosition(
+                traceID: traceID,
+                stage: "trace-finished",
+                parent: parent,
+                child: child
+            )
+            self.newTabPositionTraceID = nil
+            self.newTabPositionParent = nil
+            self.newTabPositionOriginalFrame = nil
+            self.newTabPositionOriginalDisplayID = nil
+        }
+    }
+
+    private func traceNewTabWindowMove() {
+        guard let traceID = newTabPositionTraceID,
+              let parent = newTabPositionParent,
+              let originalFrame = newTabPositionOriginalFrame else { return }
+
+        let role = window === parent ? "parent" : "child"
+        Self.logNewTabPosition(
+            traceID: traceID,
+            stage: "\(role)-window-did-move",
+            parent: parent,
+            child: role == "child" ? window : nil
+        )
+        Self.restoreNewTabParentDisplayIfNeeded(
+            traceID: traceID,
+            stage: "\(role)-window-did-move",
+            parent: parent,
+            originalFrame: originalFrame,
+            originalDisplayID: newTabPositionOriginalDisplayID
+        )
+    }
+
     // MARK: Base Controller Overrides
 
     override func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
@@ -230,6 +288,82 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // so we pass .zero to let cascade use the current frame position.
             lastCascadePoint = window.cascadeTopLeft(from: .zero)
         }
+    }
+
+    private static func newTabScreenDescription(_ screen: NSScreen?) -> String {
+        guard let screen else { return "nil" }
+        let displayID = screen.displayID.map { String($0) } ?? "nil"
+        return "\(screen.localizedName)#\(displayID)"
+    }
+
+    private static func newTabWindowDescription(_ window: NSWindow?) -> String {
+        guard let window else { return "nil" }
+
+        let id = String(describing: ObjectIdentifier(window))
+        let groupID = window.tabGroup.map { String(describing: ObjectIdentifier($0)) } ?? "nil"
+        let selectedID = window.tabGroup?.selectedWindow
+            .map { String(describing: ObjectIdentifier($0)) } ?? "nil"
+        let groupWindows = window.tabGroup?.windows.map {
+            let memberID = String(describing: ObjectIdentifier($0))
+            return "\(memberID)@\(newTabScreenDescription($0.screen)):\(NSStringFromRect($0.frame))"
+        }.joined(separator: ",") ?? ""
+
+        return "id=\(id) frame=\(NSStringFromRect(window.frame)) " +
+            "screen=\(newTabScreenDescription(window.screen)) key=\(window.isKeyWindow) " +
+            "main=\(window.isMainWindow) visible=\(window.isVisible) " +
+            "tabbingMode=\(window.tabbingMode.rawValue) group=\(groupID) " +
+            "selected=\(selectedID) members=[\(groupWindows)]"
+    }
+
+    private static func logNewTabPosition(
+        traceID: String,
+        stage: String,
+        parent: NSWindow?,
+        child: NSWindow?
+    ) {
+        let parentDescription = newTabWindowDescription(parent)
+        let childDescription = newTabWindowDescription(child)
+        let keyDescription = newTabWindowDescription(NSApp.keyWindow)
+        let mainScreenDescription = newTabScreenDescription(NSScreen.main)
+        let mouseLocation = NSStringFromPoint(NSEvent.mouseLocation)
+        let message = "new-tab-position trace=\(traceID) stage=\(stage) " +
+            "parent={\(parentDescription)} child={\(childDescription)} " +
+            "key={\(keyDescription)} mainScreen=\(mainScreenDescription) " +
+            "mouse=\(mouseLocation)"
+        Ghostty.logger.notice("\(message, privacy: .public)")
+    }
+
+    private static func restoreNewTabParentDisplayIfNeeded(
+        traceID: String,
+        stage: String,
+        parent: NSWindow,
+        originalFrame: NSRect,
+        originalDisplayID: UInt32?
+    ) {
+        guard !parent.styleMask.contains(.fullScreen),
+              let originalDisplayID,
+              let currentDisplayID = parent.screen?.displayID,
+              currentDisplayID != originalDisplayID else { return }
+
+        logNewTabPosition(
+            traceID: traceID,
+            stage: "\(stage)-display-change-detected",
+            parent: parent,
+            child: nil
+        )
+
+        // AppKit can move the entire native tab group while constructing or
+        // presenting the backing NSWindow. Moving the selected backing window
+        // restores the visible tab group as a whole.
+        let visibleWindow = parent.tabGroup?.selectedWindow ?? parent
+        visibleWindow.setFrame(originalFrame, display: true)
+
+        logNewTabPosition(
+            traceID: traceID,
+            stage: "\(stage)-display-restored",
+            parent: parent,
+            child: nil
+        )
     }
 
     // The preferred parent terminal controller.
@@ -441,60 +575,155 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             return nil
         }
 
+        // Capture the intended display before loading the backing window. Setting
+        // tabbingMode to preferred can cause AppKit to move the parent during load.
+        let traceID = String(UUID().uuidString.prefix(8))
+        let originalParentFrame = parent.frame
+        let originalParentDisplayID = parent.screen?.displayID
+        logNewTabPosition(
+            traceID: traceID,
+            stage: "request",
+            parent: parent,
+            child: nil
+        )
+        parentController.beginNewTabPositionTrace(
+            traceID: traceID,
+            parent: parent,
+            originalFrame: originalParentFrame,
+            originalDisplayID: originalParentDisplayID
+        )
+
         // Create a new window and add it to the parent
         let controller = TerminalController.init(ghostty, withBaseConfig: baseConfig)
+        controller.beginNewTabPositionTrace(
+            traceID: traceID,
+            parent: parent,
+            originalFrame: originalParentFrame,
+            originalDisplayID: originalParentDisplayID
+        )
         controller.isBackgroundOpaque = parentController.isBackgroundOpaque
         guard let window = controller.window else { return controller }
+
+        logNewTabPosition(
+            traceID: traceID,
+            stage: "child-loaded",
+            parent: parent,
+            child: window
+        )
+        restoreNewTabParentDisplayIfNeeded(
+            traceID: traceID,
+            stage: "child-loaded",
+            parent: parent,
+            originalFrame: originalParentFrame,
+            originalDisplayID: originalParentDisplayID
+        )
 
         // If the parent is miniaturized, then macOS exhibits really strange behaviors
         // so we have to bring it back out.
         if parent.isMiniaturized { parent.deminiaturize(self) }
 
-        // If our parent tab group already has this window, macOS added it and
-        // we need to remove it so we can set the correct order in the next line.
+        // If macOS already added this window to any tab group, remove it so we
+        // can attach it to the intended parent in the correct order below.
         // If we don't do this, macOS gets really confused and the tabbedWindows
         // state becomes incorrect.
         //
-        // At the time of writing this code, the only known case this happens
-        // is when the "+" button is clicked in the tab bar.
-        if let tg = parent.tabGroup,
-           tg.windows.firstIndex(of: window) != nil {
-            tg.removeWindow(window)
+        // AppKit may do this when the "+" button is clicked in the tab bar or
+        // when the user's automatic window tabbing preference applies.
+        if let tabGroup = window.tabGroup,
+           tabGroup.windows.count > 1,
+           tabGroup.windows.contains(window) {
+            logNewTabPosition(
+                traceID: traceID,
+                stage: "automatic-tab-before-detach",
+                parent: parent,
+                child: window
+            )
+            tabGroup.removeWindow(window)
+            logNewTabPosition(
+                traceID: traceID,
+                stage: "automatic-tab-after-detach",
+                parent: parent,
+                child: window
+            )
         }
+        restoreNewTabParentDisplayIfNeeded(
+            traceID: traceID,
+            stage: "automatic-tab-detach",
+            parent: parent,
+            originalFrame: originalParentFrame,
+            originalDisplayID: originalParentDisplayID
+        )
 
         // If we don't allow tabs then we create a new window instead.
+        var addedAsTab = false
         if window.tabbingMode != .disallowed {
-            let tabCreated: Bool
+            let parentFrame = parent.frame
+
+            // AppKit retains a separate frame for every backing window in a
+            // native tab group. Hidden tabs can retain stale frames after the
+            // selected tab is moved or resized, and AppKit may apply one of
+            // those frames after selecting a newly attached tab. Normalize the
+            // hidden windows before attachment so there is no delayed move to
+            // correct after the new tab becomes visible.
+            if !parent.styleMask.contains(.fullScreen) {
+                parent.tabGroup?.windows.forEach {
+                    $0.setFrame(parentFrame, display: false)
+                }
+            }
+
+            // A native tab is still backed by an NSWindow. Start it at the
+            // parent frame so AppKit doesn't infer a different display from the
+            // temporary standalone window while attaching it to the tab group.
+            window.setFrame(parentFrame, display: false)
+            logNewTabPosition(
+                traceID: traceID,
+                stage: "before-explicit-attach",
+                parent: parent,
+                child: window
+            )
+
             // Add the window to the tab group and show it.
-            switch ghostty.config.windowNewTabPosition {
-            case "end":
+            if ghostty.config.windowNewTabPosition == "end",
+               let last = parent.tabGroup?.windows.last {
                 // If we already have a tab group and we want the new tab to open at the end,
                 // then we use the last window in the tab group as the parent.
-                if let last = parent.tabGroup?.windows.last {
-                    tabCreated = last.addTabbedWindowSafely(window, ordered: .above)
-                } else {
-                    fallthrough
-                }
-
-            case "current": fallthrough
-            default:
-                tabCreated = parent.addTabbedWindowSafely(window, ordered: .above)
+                addedAsTab = last.addTabbedWindowSafely(window, ordered: .above)
+            } else {
+                addedAsTab = parent.addTabbedWindowSafely(window, ordered: .above)
             }
-            if tabCreated {
+            if addedAsTab {
                 // We set the selectedWindow early here because we want the next window
                 // to become first responder as quickly as possible. Usually this is
                 // set while `-[NSWindowController showWindow:]` is called, but we're
                 // dispatching it to resolve other issues.
                 parent.tabGroup?.selectedWindow = window
             }
+
+            logNewTabPosition(
+                traceID: traceID,
+                stage: "after-explicit-attach-success-\(addedAsTab)",
+                parent: parent,
+                child: window
+            )
+            restoreNewTabParentDisplayIfNeeded(
+                traceID: traceID,
+                stage: "explicit-attach",
+                parent: parent,
+                originalFrame: originalParentFrame,
+                originalDisplayID: originalParentDisplayID
+            )
         }
 
-        // showWindow makes regular windows key and ordered front. AppKit can
-        // throw while selecting a tab if its fullscreen stack is inconsistent,
-        // so this must cross the Objective-C exception bridge.
-        // We don't need to dispatch this because `tabbingMode = .disallowed`
-        // for HiddenTitlebarTerminalWindow.
-        controller.showWindowSafely(self)
+        if addedAsTab {
+            controller.showWindowAsTabSafely(self)
+        } else {
+            // showWindow makes regular windows key and ordered front. AppKit can
+            // throw while selecting a tab if its fullscreen stack is inconsistent,
+            // so this must cross the Objective-C exception bridge.
+            // We don't need to dispatch this because `tabbingMode = .disallowed`
+            // for HiddenTitlebarTerminalWindow.
+            controller.showWindowSafely(self)
+        }
 
         // Windows with `macos-titlebar-style = hidden` create new windows when the
         // new tab binding is pressed, we should cascade those windows as well.
@@ -503,16 +732,44 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // take effect after position in `showWindow`. Our best theory is there is some
         // next-event-loop-tick logic that Cocoa is doing that we need to be after.
         controller.scheduleInitialPresentation {
-            // Only cascade if we aren't fullscreen and are alone in the tab group.
-            if !window.styleMask.contains(.fullScreen) &&
+            Self.logNewTabPosition(
+                traceID: traceID,
+                stage: "before-presentation",
+                parent: parent,
+                child: window
+            )
+
+            // Only cascade if we're showing this as a standalone window.
+            if !addedAsTab &&
+                !window.styleMask.contains(.fullScreen) &&
                 window.tabGroup?.windows.count ?? 1 == 1 {
                 let hasFixedPos = controller.derivedConfig.windowPositionX != nil && controller.derivedConfig.windowPositionY != nil
                 Self.applyCascade(to: window, hasFixedPos: hasFixedPos)
             }
 
+            Self.logNewTabPosition(
+                traceID: traceID,
+                stage: "after-make-key",
+                parent: parent,
+                child: window
+            )
+
             // We also activate our app so that it becomes front. This may be
             // necessary for the dock menu.
             NSApp.activate(ignoringOtherApps: true)
+            Self.restoreNewTabParentDisplayIfNeeded(
+                traceID: traceID,
+                stage: "presentation",
+                parent: parent,
+                originalFrame: originalParentFrame,
+                originalDisplayID: originalParentDisplayID
+            )
+            Self.logNewTabPosition(
+                traceID: traceID,
+                stage: "after-activation",
+                parent: parent,
+                child: window
+            )
         }
 
         // It takes an event loop cycle until the macOS tabGroup state becomes
@@ -520,6 +777,19 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // is used in the tab bar. This fixes that. If we can find a more robust
         // solution we should do that.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            Self.restoreNewTabParentDisplayIfNeeded(
+                traceID: traceID,
+                stage: "settled",
+                parent: parent,
+                originalFrame: originalParentFrame,
+                originalDisplayID: originalParentDisplayID
+            )
+            Self.logNewTabPosition(
+                traceID: traceID,
+                stage: "settled",
+                parent: parent,
+                child: window
+            )
             controller.relabelTabs()
         }
 
@@ -1174,32 +1444,41 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     /// Setup correct window frame before showing the window
     override func showWindow(_ sender: Any?) {
-        guard let terminalWindow = window as? TerminalWindow else { return }
+        if !isShowingWindowAsTab {
+            guard let terminalWindow = window as? TerminalWindow else { return }
 
-        // Set the initial window position. This must happen after the window
-        // is fully set up (content view, toolbar, default size) so that
-        // decorations added by subclass awakeFromNib (e.g. toolbar for tabs
-        // style) don't change the frame after the position is restored.
-        let originChanged = terminalWindow.setInitialWindowPosition(
-            x: derivedConfig.windowPositionX,
-            y: derivedConfig.windowPositionY,
-        )
-        let restored = LastWindowPosition.shared.restore(
-            terminalWindow,
-            origin: !originChanged,
-            size: defaultSize == nil,
-        )
+            // Set the initial window position. This must happen after the window
+            // is fully set up (content view, toolbar, default size) so that
+            // decorations added by subclass awakeFromNib (e.g. toolbar for tabs
+            // style) don't change the frame after the position is restored.
+            let originChanged = terminalWindow.setInitialWindowPosition(
+                x: derivedConfig.windowPositionX,
+                y: derivedConfig.windowPositionY,
+            )
+            let restored = LastWindowPosition.shared.restore(
+                terminalWindow,
+                origin: !originChanged,
+                size: defaultSize == nil,
+            )
 
-        // If nothing is changed for the frame,
-        // we should center the window
-        if !originChanged, !restored {
-            // This doesn't work in `windowDidLoad` somehow
-            terminalWindow.center()
+            // If nothing is changed for the frame,
+            // we should center the window
+            if !originChanged, !restored {
+                // This doesn't work in `windowDidLoad` somehow
+                terminalWindow.center()
+            }
         }
 
         super.showWindow(sender)
 
         syncAppearance()
+    }
+
+    /// Safely shows a window that AppKit has already attached as a native tab.
+    private func showWindowAsTabSafely(_ sender: Any?) {
+        isShowingWindowAsTab = true
+        defer { isShowingWindowAsTab = false }
+        showWindowSafely(sender)
     }
 
     // Shows the "+" button in the tab bar, responds to that click.
@@ -1271,6 +1550,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     override func windowDidMove(_ notification: Notification) {
+        traceNewTabWindowMove()
         super.windowDidMove(notification)
         self.fixTabBar()
 
